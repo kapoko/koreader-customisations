@@ -69,6 +69,77 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         end
     end
 
+    local function removeQueueItemIfMatches(
+        key,
+        queued_at,
+        progress,
+        percentage
+    )
+        local queue = getQueue()
+        local item = queue[key]
+
+        if item
+            and item.queued_at == queued_at
+            and tostring(item.progress) == tostring(progress)
+            and tostring(item.percentage) == tostring(percentage)
+        then
+            logger.dbg(
+                "CWA offline queue: removing",
+                item.document
+            )
+            queue[key] = nil
+            persistQueue(queue)
+        end
+    end
+
+    local function queueCurrentProgress(instance, reason)
+        if not instance.settings.auto_sync
+            or not instance.settings.username
+            or not instance.settings.password
+            or not instance.settings.server
+        then
+            return nil
+        end
+
+        local document = instance:getDocumentDigest()
+
+        if not document then
+            logger.warn(
+                "CWA offline queue: cannot queue " .. reason .. "; no document digest"
+            )
+            return nil
+        end
+
+        local key = makeQueueKey(
+            instance.settings.server,
+            instance.settings.username,
+            document
+        )
+        local queue = getQueue()
+
+        -- Latest snapshot wins for this book/account/server.
+        queue[key] = {
+            document = document,
+            progress = instance:getLastProgress(),
+            percentage = instance:getLastPercent(),
+            device = Device.model,
+            device_id = instance.device_id,
+            queued_at = os.time(),
+            server = instance.settings.server,
+            username = instance.settings.username,
+        }
+
+        persistQueue(queue)
+
+        logger.dbg(
+            "CWA offline queue: persisted " .. reason .. " progress",
+            document,
+            queue[key].percentage
+        )
+
+        return key
+    end
+
     local function findMatchingItem(
         queue,
         server,
@@ -282,7 +353,12 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                         item.document
                     )
 
-                    removeQueueItem(key)
+                    removeQueueItemIfMatches(
+                        key,
+                        item.queued_at,
+                        item.progress,
+                        item.percentage
+                    )
                     processNext()
                 end
             )
@@ -879,6 +955,35 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         end
     end
 
+    local function queueAndFlushCurrentProgress(instance, reason)
+        local key = queueCurrentProgress(instance, reason)
+
+        if not key then
+            return
+        end
+
+        if silent_connect_in_progress then
+            logger.dbg(
+                "CWA offline queue: deferring " .. reason .. " flush during silent connection"
+            )
+            return
+        end
+
+        silentlyGetOnline(function(online)
+            if not online then
+                return
+            end
+
+            flushQueue(
+                instance,
+                function()
+                    cleanupWifi()
+                end,
+                key
+            )
+        end)
+    end
+
     ----------------------------------------------------------------
     -- Install lifecycle handlers only once
     ----------------------------------------------------------------
@@ -979,6 +1084,16 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     -- Suspend
     ----------------------------------------------------------------
 
+    CWASync.onIdleSync = function(self)
+        STATE.instance = self
+
+        logger.dbg(
+            "CWA offline queue: onIdleSync"
+        )
+
+        queueAndFlushCurrentProgress(self, "idle")
+    end
+
     CWASync._onSuspend = function(self)
         STATE.instance = self
 
@@ -986,11 +1101,16 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             "CWA offline queue: onSuspend"
         )
 
+        local key = queueCurrentProgress(self, "suspend")
+
+        if not key then
+            return
+        end
+
         if silent_connect_in_progress then
             logger.dbg(
-                "CWA offline queue: ignoring Suspend during silent connection"
+                "CWA offline queue: deferring suspend push during silent connection"
             )
-
             return
         end
 
@@ -999,22 +1119,12 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                 return
             end
 
+            -- Retain CWA's normal suspend push. The saved queue entry is
+            -- flushed after its callback or retried on a later connection.
             runManagedOperation(
                 self,
                 function()
-                    ------------------------------------------------
-                    -- Stock CWA's on_suspend=true path disconnects
-                    -- Wi-Fi immediately after STARTING its async
-                    -- request.
-                    --
-                    -- We wait for the actual HTTP completion instead.
-                    ------------------------------------------------
-
-                    self:updateProgress(
-                        false,
-                        false,
-                        false
-                    )
+                    self:updateProgress(false, false, false)
                 end,
                 true
             )
@@ -1040,73 +1150,12 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         self.onResume = nil
         self.onSuspend = nil
 
-        if not self.settings.auto_sync
-            or not self.settings.username
-            or not self.settings.password
-            or not self.settings.server
-        then
+        -- Capture everything before the document object disappears.
+        local key = queueCurrentProgress(self, "close")
+
+        if not key then
             return
         end
-
-        ------------------------------------------------------------
-        -- Capture EVERYTHING before the document object disappears.
-        ------------------------------------------------------------
-
-        local document =
-            self:getDocumentDigest()
-
-        if not document then
-            logger.warn(
-                "CWA offline queue: cannot queue close; no document digest"
-            )
-
-            return
-        end
-
-        local key = makeQueueKey(
-            self.settings.server,
-            self.settings.username,
-            document
-        )
-
-        local queue = getQueue()
-
-        ------------------------------------------------------------
-        -- Latest close wins for this book/account/server.
-        ------------------------------------------------------------
-
-        queue[key] = {
-            document = document,
-
-            progress =
-                self:getLastProgress(),
-
-            percentage =
-                self:getLastPercent(),
-
-            device =
-                Device.model,
-
-            device_id =
-                self.device_id,
-
-            queued_at =
-                os.time(),
-
-            server =
-                self.settings.server,
-
-            username =
-                self.settings.username,
-        }
-
-        persistQueue(queue)
-
-        logger.dbg(
-            "CWA offline queue: persisted close progress",
-            document,
-            queue[key].percentage
-        )
 
         ------------------------------------------------------------
         -- If Wi-Fi genuinely isn't available/allowed, this simply
@@ -1222,5 +1271,75 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         safe_to_reconnect = false
 
         return original_onNetworkDisconnecting(self)
+    end
+end)
+
+userpatch.registerPatchPluginFunc("autosuspend", function(AutoSuspend)
+    local Event = require("ui/event")
+    local UIManager = require("ui/uimanager")
+    local logger = require("logger")
+
+    local IDLE_SYNC_LEAD_SECONDS = 60
+
+    if AutoSuspend._cwasync_idle_sync_wrapped then
+        return
+    end
+
+    AutoSuspend._cwasync_idle_sync_wrapped = true
+
+    local original_start = AutoSuspend._start
+    local original_unschedule = AutoSuspend._unschedule
+    local original_on_input_event = AutoSuspend.onInputEvent
+
+    local function cancelIdleSync(self)
+        if self._cwasync_idle_sync_task then
+            UIManager:unschedule(self._cwasync_idle_sync_task)
+            self._cwasync_idle_sync_task = nil
+        end
+    end
+
+    local function scheduleIdleSync(self)
+        cancelIdleSync(self)
+
+        if not self:_enabled() then
+            return
+        end
+
+        local delay =
+            self.auto_suspend_timeout_seconds
+            - IDLE_SYNC_LEAD_SECONDS
+
+        if delay <= 0 then
+            return
+        end
+
+        self._cwasync_idle_sync_task = function()
+            self._cwasync_idle_sync_task = nil
+
+            logger.dbg("AutoSuspend: starting idle sync")
+            UIManager:broadcastEvent(Event:new("IdleSync"))
+        end
+
+        UIManager:scheduleIn(
+            delay,
+            self._cwasync_idle_sync_task
+        )
+    end
+
+    AutoSuspend._start = function(self, ...)
+        local result = original_start(self, ...)
+        scheduleIdleSync(self)
+        return result
+    end
+
+    AutoSuspend._unschedule = function(self, ...)
+        cancelIdleSync(self)
+        return original_unschedule(self, ...)
+    end
+
+    AutoSuspend.onInputEvent = function(self, ...)
+        local result = original_on_input_event(self, ...)
+        scheduleIdleSync(self)
+        return result
     end
 end)
