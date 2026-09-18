@@ -3,6 +3,10 @@ local userpatch = require("userpatch")
 userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local _ = require("gettext")
     local CWASyncClient = require("CWASyncClient")
+    local HorizontalGroup = require("ui/widget/horizontalgroup")
+    local HorizontalSpan = require("ui/widget/horizontalspan")
+    local Size = require("ui/size")
+    local TextWidget = require("ui/widget/textwidget")
     local TouchMenu = require("ui/widget/touchmenu")
 
     local SETTING_KEY = "cwasync_last_successful_sync"
@@ -21,17 +25,9 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         )
     end
 
-    -- This wrapper is installed after the Wi-Fi footer wrapper, so prepending
-    -- here keeps the latest CWA result immediately to the icon's left.
+    -- The right footer column shares its boundary with pagination, so show the
+    -- sync state in the independent left column instead.
     local function decorateFooter(tm)
-        local text = tm.time_info and tm.time_info.text
-        if not text or text == "" then return end
-        if text:find(PUSH_ARROW .. " (", 1, true)
-            or text:find(PULL_ARROW .. " (", 1, true)
-        then
-            return
-        end
-
         local timestamp = tonumber(G_reader_settings:readSetting(SETTING_KEY))
         local sync_type = G_reader_settings:readSetting(TYPE_SETTING_KEY)
         if not timestamp or (sync_type ~= "push" and sync_type ~= "pull") then
@@ -39,7 +35,27 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         end
 
         local direction = sync_type == "push" and PUSH_ARROW or PULL_ARROW
-        tm.time_info:setText(direction .. " (" .. os.date("%H:%M", timestamp) .. ") " .. text)
+        if not tm._cwasync_last_sync_footer_text then
+            local footer_left = tm.footer and tm.footer[1]
+            local up_button = footer_left and footer_left[1]
+            if not footer_left or not up_button then return end
+
+            local sync_text = TextWidget:new{
+                text = "",
+                face = tm.fface,
+            }
+            footer_left[1] = HorizontalGroup:new{
+                align = "center",
+                up_button,
+                HorizontalSpan:new{ width = Size.span.horizontal_default },
+                sync_text,
+            }
+            tm._cwasync_last_sync_footer_text = sync_text
+        end
+
+        tm._cwasync_last_sync_footer_text:setText(
+            direction .. " " .. os.date("%H:%M", timestamp)
+        )
     end
 
     local function wrapFooterUpdateItems()
