@@ -5,11 +5,16 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local CWASyncClient = require("CWASyncClient")
 
     local SETTING_KEY = "cwasync_last_successful_sync"
+    local TYPE_SETTING_KEY = "cwasync_last_successful_sync_type"
 
-    local function recordSuccessfulSync()
+    local function recordSuccessfulSync(sync_type)
         G_reader_settings:saveSetting(
             SETTING_KEY,
             os.time()
+        )
+        G_reader_settings:saveSetting(
+            TYPE_SETTING_KEY,
+            sync_type
         )
     end
 
@@ -39,7 +44,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         )
             local wrapped_callback = function(ok, body)
                 if ok then
-                    recordSuccessfulSync()
+                    recordSuccessfulSync("push")
                 end
 
                 if callback then
@@ -74,7 +79,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                     and body.percentage ~= nil
                     and body.progress ~= nil
                 then
-                    recordSuccessfulSync()
+                    recordSuccessfulSync("pull")
                 end
 
                 if callback then
@@ -133,6 +138,20 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                 if not timestamp then
                     return _(
                         "Last successful sync: Never"
+                    )
+                end
+
+                local sync_type =
+                    G_reader_settings:readSetting(
+                        TYPE_SETTING_KEY
+                    )
+
+                if sync_type then
+                    return _(
+                        "Last successful sync ("
+                    ) .. sync_type .. "): " .. os.date(
+                        "%d-%m-%Y %H:%M",
+                        timestamp
                     )
                 end
 
