@@ -7,6 +7,8 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
 
     local SETTING_KEY = "cwasync_last_successful_sync"
     local TYPE_SETTING_KEY = "cwasync_last_successful_sync_type"
+    local PUSH_ARROW = "\u{2191}"
+    local PULL_ARROW = "\u{2193}"
 
     local function recordSuccessfulSync(sync_type)
         G_reader_settings:saveSetting(
@@ -24,8 +26,8 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local function decorateFooter(tm)
         local text = tm.time_info and tm.time_info.text
         if not text or text == "" then return end
-        if text:match("^push %(%d%d:%d%d%) ")
-            or text:match("^pull %(%d%d:%d%d%) ")
+        if text:find(PUSH_ARROW .. " (", 1, true)
+            or text:find(PULL_ARROW .. " (", 1, true)
         then
             return
         end
@@ -36,7 +38,8 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             return
         end
 
-        tm.time_info:setText(sync_type .. " (" .. os.date("%H:%M", timestamp) .. ") " .. text)
+        local direction = sync_type == "push" and PUSH_ARROW or PULL_ARROW
+        tm.time_info:setText(direction .. " (" .. os.date("%H:%M", timestamp) .. ") " .. text)
     end
 
     local function wrapFooterUpdateItems()
