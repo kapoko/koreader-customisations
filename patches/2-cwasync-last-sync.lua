@@ -3,6 +3,7 @@ local userpatch = require("userpatch")
 userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local _ = require("gettext")
     local CWASyncClient = require("CWASyncClient")
+    local TouchMenu = require("ui/widget/touchmenu")
 
     local SETTING_KEY = "cwasync_last_successful_sync"
     local TYPE_SETTING_KEY = "cwasync_last_successful_sync_type"
@@ -17,6 +18,41 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             sync_type
         )
     end
+
+    -- This wrapper is installed after the Wi-Fi footer wrapper, so prepending
+    -- here keeps the latest CWA result immediately to the icon's left.
+    local function decorateFooter(tm)
+        local text = tm.time_info and tm.time_info.text
+        if not text or text == "" then return end
+        if text:match("^push %(%d%d:%d%d%) ")
+            or text:match("^pull %(%d%d:%d%d%) ")
+        then
+            return
+        end
+
+        local timestamp = tonumber(G_reader_settings:readSetting(SETTING_KEY))
+        local sync_type = G_reader_settings:readSetting(TYPE_SETTING_KEY)
+        if not timestamp or (sync_type ~= "push" and sync_type ~= "pull") then
+            return
+        end
+
+        tm.time_info:setText(sync_type .. " (" .. os.date("%H:%M", timestamp) .. ") " .. text)
+    end
+
+    local function wrapFooterUpdateItems()
+        local inner = TouchMenu.updateItems
+        if inner == TouchMenu._cwasync_last_sync_footer_wrapper then return end
+
+        local function wrapper(self, ...)
+            inner(self, ...)
+            decorateFooter(self)
+        end
+
+        TouchMenu._cwasync_last_sync_footer_wrapper = wrapper
+        TouchMenu.updateItems = wrapper
+    end
+
+    wrapFooterUpdateItems()
 
     ------------------------------------------------------------
     -- Wrap client only ONCE.
