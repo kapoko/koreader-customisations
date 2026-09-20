@@ -4,6 +4,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local NetworkMgr = require("ui/network/manager")
     local UIManager = require("ui/uimanager")
     local Device = require("device")
+    local band = require("bit").band
     local logger = require("logger")
     local md5 = require("ffi/sha2").md5
     local CWASyncClient = require("CWASyncClient")
@@ -189,6 +190,22 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local safe_to_reconnect = false
     local silent_connect_in_progress = false
     local intentional_disconnect = false
+
+    -- On PocketBook, isOnline() means connected, not that the Wi-Fi radio is
+    -- enabled. An already-enabled radio can reconnect without a power-on prompt.
+    local function wifiRadioIsOn()
+        for _, ifname in ipairs({ "eth0", "wlan0" }) do
+            local f = io.open("/sys/class/net/" .. ifname .. "/flags", "r")
+            if f then
+                local flags = tonumber(f:read("*l"))
+                f:close()
+                if flags and band(flags, 1) ~= 0 then
+                    return true
+                end
+            end
+        end
+        return false
+    end
 
     local function cleanupWifi()
         intentional_disconnect = true
@@ -854,7 +871,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         -- silently with zero dialog.
         ------------------------------------------------------------
 
-        if not safe_to_reconnect then
+        if not safe_to_reconnect and not wifiRadioIsOn() then
             logger.dbg(
                 "CWA offline queue: offline; reconnect not known safe, skipping"
             )
@@ -920,6 +937,8 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             callback(false)
         end
 
+        local check_scheduled = false
+
         local function checkConnection()
             if finished then
                 return
@@ -937,18 +956,32 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                 return
             end
 
-            UIManager:scheduleIn(
-                0.5,
-                checkConnection
-            )
+            check_scheduled = true
+            UIManager:scheduleIn(0.5, function()
+                check_scheduled = false
+                checkConnection()
+            end)
+        end
+
+        local function scheduleConnectionCheck()
+            if finished or check_scheduled then
+                return
+            end
+
+            check_scheduled = true
+            UIManager:scheduleIn(0.5, function()
+                check_scheduled = false
+                checkConnection()
+            end)
         end
 
         local status = NetworkMgr:turnOnWifi(function()
-            UIManager:scheduleIn(
-                0.5,
-                checkConnection
-            )
+            scheduleConnectionCheck()
         end)
+
+        -- PocketBook may not invoke the callback when its prompt disappears.
+        -- Start the watchdog regardless so the attempt cannot remain stuck.
+        scheduleConnectionCheck()
 
         if status == false then
             finish(false)
