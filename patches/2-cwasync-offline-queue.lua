@@ -1307,6 +1307,9 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     end
 end)
 
+--[=[
+-- Disabled until KOReader's autosuspend timeout is configured deliberately.
+-- Normal CWA suspend handling above remains active.
 userpatch.registerPatchPluginFunc("autosuspend", function(AutoSuspend)
     local Event = require("ui/event")
     local UIManager = require("ui/uimanager")
@@ -1376,3 +1379,4 @@ userpatch.registerPatchPluginFunc("autosuspend", function(AutoSuspend)
         return result
     end
 end)
+]=]
