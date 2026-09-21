@@ -1,124 +1,67 @@
 local userpatch = require("userpatch")
 
 userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    local Device = require("device")
     local NetworkMgr = require("ui/network/manager")
     local UIManager = require("ui/uimanager")
-    local Device = require("device")
     local band = require("bit").band
     local logger = require("logger")
     local md5 = require("ffi/sha2").md5
+    local SyncLogic = require("sync_logic")
+
     local CWASyncClient = require("CWASyncClient")
-
     local QUEUE_KEY = "cwasync_pending_progress_queue"
+    local CWA_SYNC_SILENT = 2 -- CWA's private SYNC_STRATEGY.SILENT value.
+    local state = CWASyncClient._cwasync_offline_queue_state
 
-    ----------------------------------------------------------------
-    -- Shared module state
-    ----------------------------------------------------------------
-
-    local STATE = CWASyncClient._cwasync_offline_queue_state
-
-    if not STATE then
-        STATE = {
-            instance = nil,
-            next_request_session = nil,
-            queue_flushing = false,
-            queue_waiters = {},
+    if not state then
+        state = {
+            flushing = false,
+            waiters = {},
+            after_pull = nil,
+            pulling = false,
+            pull = nil,
         }
-
-        CWASyncClient._cwasync_offline_queue_state = STATE
+        CWASyncClient._cwasync_offline_queue_state = state
     end
 
-    ----------------------------------------------------------------
-    -- Persistent queue
-    ----------------------------------------------------------------
+    local function queueKey(server, username, document)
+        return md5(table.concat({ server, username, document }, "\0"))
+    end
 
-    local function getQueue()
+    local function readQueue()
         return G_reader_settings:readSetting(QUEUE_KEY, {})
     end
 
-    local function persistQueue(queue)
+    local function saveQueue(queue)
         G_reader_settings:saveSetting(QUEUE_KEY, queue)
-
-        -- Pending progress exists specifically to survive restarts,
-        -- crashes and shutdowns, so write it immediately.
         if G_reader_settings.flush then
             G_reader_settings:flush()
         end
     end
 
-    local function makeQueueKey(server, username, document)
-        return md5(
-            tostring(server)
-            .. "\0"
-            .. tostring(username)
-            .. "\0"
-            .. tostring(document)
-        )
-    end
-
-    local function removeQueueItem(key)
-        local queue = getQueue()
-
-        if queue[key] then
-            logger.dbg(
-                "CWA offline queue: removing",
-                queue[key].document
-            )
-
-            queue[key] = nil
-            persistQueue(queue)
-        end
-    end
-
-    local function removeQueueItemIfMatches(
-        key,
-        queued_at,
-        progress,
-        percentage
-    )
-        local queue = getQueue()
-        local item = queue[key]
-
-        if item
-            and item.queued_at == queued_at
-            and tostring(item.progress) == tostring(progress)
-            and tostring(item.percentage) == tostring(percentage)
-        then
-            logger.dbg(
-                "CWA offline queue: removing",
-                item.document
-            )
-            queue[key] = nil
-            persistQueue(queue)
-        end
+    local function sameSnapshot(saved, item)
+        return saved and saved.queued_at == item.queued_at
+            and tostring(saved.progress) == tostring(item.progress)
+            and tostring(saved.percentage) == tostring(item.percentage)
     end
 
     local function queueCurrentProgress(instance, reason)
-        if not instance.settings.auto_sync
-            or not instance.settings.username
-            or not instance.settings.password
-            or not instance.settings.server
-        then
-            return nil
+        local settings = instance.settings
+        if not settings.auto_sync or not settings.server or not settings.username
+            or not settings.password then
+            return
         end
 
         local document = instance:getDocumentDigest()
-
         if not document then
-            logger.warn(
-                "CWA offline queue: cannot queue " .. reason .. "; no document digest"
-            )
-            return nil
+            logger.warn("CWA queue: cannot queue " .. reason .. "; no document digest")
+            return
         end
 
-        local key = makeQueueKey(
-            instance.settings.server,
-            instance.settings.username,
-            document
-        )
-        local queue = getQueue()
-
-        -- Latest snapshot wins for this book/account/server.
+        local key = queueKey(settings.server, settings.username, document)
+        local queue = readQueue()
         queue[key] = {
             document = document,
             progress = instance:getLastProgress(),
@@ -126,73 +69,313 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             device = Device.model,
             device_id = instance.device_id,
             queued_at = os.time(),
-            server = instance.settings.server,
-            username = instance.settings.username,
+            server = settings.server,
+            username = settings.username,
         }
-
-        persistQueue(queue)
-
-        logger.dbg(
-            "CWA offline queue: persisted " .. reason .. " progress",
-            document,
-            queue[key].percentage
-        )
-
+        saveQueue(queue)
+        logger.dbg("CWA queue: saved " .. reason .. " progress", document)
         return key
     end
 
-    local function findMatchingItem(
-        queue,
-        server,
-        username,
-        skipped,
-        preferred_key
-    )
-        if preferred_key
-            and not skipped[preferred_key]
-        then
-            local preferred = queue[preferred_key]
+    local function removeQueueItem(key, item)
+        local queue = readQueue()
+        if sameSnapshot(queue[key], item) then
+            queue[key] = nil
+            saveQueue(queue)
+        end
+    end
 
-            if preferred
-                and preferred.server == server
-                and preferred.username == username
-            then
-                return preferred_key, preferred
+    local function markConflict(key, item, body)
+        local queue = readQueue()
+        if not sameSnapshot(queue[key], item) then
+            return
+        end
+
+        queue[key].conflict = true
+        queue[key].remote_progress = body.progress
+        queue[key].remote_percentage = body.percentage
+        queue[key].remote_device = body.device
+        saveQueue(queue)
+        logger.warn("CWA queue: retaining conflicting progress", item.document)
+    end
+
+    local function matchingItem(queue, settings, skipped, preferred_key)
+        if preferred_key and not skipped[preferred_key] then
+            local item = queue[preferred_key]
+            if item and item.server == settings.server and item.username == settings.username then
+                return preferred_key, item
             end
         end
 
         for key, item in pairs(queue) do
-            if not skipped[key]
-                and item.server == server
-                and item.username == username
-            then
+            if not skipped[key] and item.server == settings.server
+                and item.username == settings.username then
                 return key, item
             end
         end
-
-        return nil, nil
     end
 
-    ----------------------------------------------------------------
-    -- Wi-Fi state
-    --
-    -- This deliberately preserves the behavior of the last
-    -- silent-offline patch:
-    --
-    -- * already online -> use it
-    -- * KOReader previously disconnected a known-good connection
-    --   -> reconnect silently
-    -- * genuinely offline / Wi-Fi intent unknown -> do NOTHING
-    --
-    -- This avoids the PocketBook "turn Wi-Fi on" nag loop.
-    ----------------------------------------------------------------
+    local function showCurrentConflict(instance, key, item, body, done)
+        local local_percent = tonumber(item.percentage)
+        local remote_percent = tonumber(body.percentage)
+        local device = body.device or "another device"
+        local remote = SyncLogic.resolveRemotePosition(body)
+
+        if not local_percent or not remote_percent then
+            logger.warn("CWA queue: invalid conflict percentage", item.document)
+            done()
+            return
+        end
+
+        local function keepLocal()
+            local settings = instance.settings
+            local client = CWASyncClient:new{
+                service_url = settings.server .. "/kosync",
+                service_spec = instance.path .. "/api.json",
+            }
+            local ok, err = pcall(client.update_progress, client,
+                settings.username, settings.password, item.document,
+                item.progress, item.percentage, item.device, item.device_id,
+                function(success)
+                    if success then
+                        removeQueueItem(key, item)
+                    else
+                        logger.warn("CWA queue: chosen local push failed", item.document)
+                    end
+                    done()
+                end)
+            if not ok then
+                logger.warn("CWA queue: could not start chosen local push", err)
+                done()
+            end
+        end
+
+        UIManager:show(ConfirmBox:new{
+            text = string.format(
+                "Progress conflict with %s:\nThis device: %.2f%%\nServer: %.2f%%",
+                device,
+                local_percent * 100,
+                remote_percent * 100
+            ),
+            ok_text = string.format("Use server (%.2f%%)", remote_percent * 100),
+            cancel_text = string.format("Keep local (%.2f%%)", local_percent * 100),
+            ok_callback = function()
+                removeQueueItem(key, item)
+                instance:syncToProgress(remote)
+                done()
+            end,
+            cancel_callback = keepLocal,
+        })
+    end
+
+    -- Timestamps order queued and server positions. A user decides only when
+    -- the newer state would replace a farther-ahead reading position.
+    local function flushQueue(instance, done, preferred_key, resolve_current)
+        done = done or function() end
+
+        if state.flushing then
+            table.insert(state.waiters, done)
+            return
+        end
+
+        local settings = instance and instance.settings
+        if not settings or not settings.server or not settings.username
+            or not settings.password or not NetworkMgr:isOnline() then
+            done(false)
+            return
+        end
+
+        state.flushing = true
+        state.waiters = { done }
+        local skipped = {}
+        local first_key = preferred_key
+        local current_document = resolve_current and instance:getDocumentDigest()
+
+        local function finish(success)
+            if not state.flushing then
+                return
+            end
+            state.flushing = false
+            local waiters = state.waiters
+            state.waiters = {}
+            for _, waiter in ipairs(waiters) do
+                local ok, err = pcall(waiter, success)
+                if not ok then
+                    logger.warn("CWA queue: waiter failed", err)
+                end
+            end
+        end
+
+        local processNext
+
+        local function pushItem(key, item)
+            local client = CWASyncClient:new{
+                service_url = settings.server .. "/kosync",
+                service_spec = instance.path .. "/api.json",
+            }
+            local ok, err = pcall(client.update_progress, client,
+                settings.username, settings.password, item.document,
+                item.progress, item.percentage, item.device, item.device_id,
+                function(success)
+                    if not success then
+                        logger.warn("CWA queue: push failed; keeping item", item.document)
+                        finish(false)
+                        return
+                    end
+                    removeQueueItem(key, item)
+                    processNext()
+                end)
+            if not ok then
+                logger.warn("CWA queue: could not start push", err)
+                finish(false)
+            end
+        end
+
+        processNext = function()
+            if not NetworkMgr:isOnline() then
+                finish(false)
+                return
+            end
+
+            local key, item = matchingItem(readQueue(), settings, skipped, first_key)
+            first_key = nil
+            if not key then
+                finish(true)
+                return
+            end
+
+            local client = CWASyncClient:new{
+                service_url = settings.server .. "/kosync",
+                service_spec = instance.path .. "/api.json",
+            }
+            client._cwasync_queue_request = true
+            local ok, err = pcall(client.get_progress, client,
+                settings.username, settings.password, item.document,
+                function(success, body)
+                    if not success or type(body) ~= "table" then
+                        logger.warn("CWA queue: remote check failed; keeping item", item.document)
+                        finish(false)
+                        return
+                    end
+
+                    if body.percentage == nil then
+                        pushItem(key, item)
+                        return
+                    end
+
+                    if body.progress ~= nil and tostring(body.progress) == tostring(item.progress) then
+                        removeQueueItem(key, item)
+                        processNext()
+                        return
+                    end
+
+                    local remote = SyncLogic.resolveRemotePosition(body)
+                    local local_percent = tonumber(item.percentage)
+                    local remote_percent = tonumber(body.percentage)
+                    if body.progress == nil or remote.kind == "none"
+                        or not local_percent or not remote_percent then
+                        markConflict(key, item, body)
+                        skipped[key] = true
+                        processNext()
+                        return
+                    end
+
+                    local local_is_newer = tonumber(item.queued_at)
+                        and tonumber(body.timestamp)
+                        and tonumber(item.queued_at) > tonumber(body.timestamp)
+                    local replaces_ahead_position = (local_is_newer
+                        and local_percent < remote_percent)
+                        or (not local_is_newer and remote_percent < local_percent)
+
+                    if replaces_ahead_position then
+                        markConflict(key, item, body)
+                        skipped[key] = true
+                        if resolve_current and item.document == current_document then
+                            showCurrentConflict(instance, key, item, body, processNext)
+                        else
+                            processNext()
+                        end
+                    elseif local_is_newer then
+                        pushItem(key, item)
+                    elseif resolve_current and item.document == current_document then
+                        markConflict(key, item, body)
+                        showCurrentConflict(instance, key, item, body, processNext)
+                    else
+                        removeQueueItem(key, item)
+                        processNext()
+                    end
+                end)
+            if not ok then
+                logger.warn("CWA queue: could not start remote check", err)
+                finish(false)
+            end
+        end
+
+        processNext()
+    end
+
+    if not CWASyncClient._offline_queue_pull_wrapped then
+        CWASyncClient._offline_queue_pull_wrapped = true
+        local original_get_progress = CWASyncClient.get_progress
+        CWASyncClient.get_progress = function(client, username, password, document, callback)
+            local after_pull
+            if not client._cwasync_queue_request then
+                after_pull = state.after_pull
+                state.after_pull = nil
+            end
+            return original_get_progress(client, username, password, document,
+                function(ok, body)
+                    local pull = state.pull
+                    if pull and not client._cwasync_queue_request then
+                        pull.body = body
+                    end
+                    if callback then
+                        callback(ok, body)
+                    end
+                    if after_pull then
+                        after_pull()
+                    end
+                end)
+        end
+    end
+
+    if not CWASync._offline_queue_sync_wrapped then
+        CWASync._offline_queue_sync_wrapped = true
+        local original_syncToProgress = CWASync.syncToProgress
+        CWASync.syncToProgress = function(self, remote)
+            local pull = state.pull
+            if not pull or pull.instance ~= self or type(pull.body) ~= "table" then
+                return original_syncToProgress(self, remote)
+            end
+
+            state.pull = nil
+            local local_percent = tonumber(pull.local_percentage)
+            local remote_percent = tonumber(pull.body.percentage)
+            if not local_percent or not remote_percent then
+                return original_syncToProgress(self, remote)
+            end
+
+            local device = pull.body.device or "another device"
+            UIManager:show(ConfirmBox:new{
+                text = string.format(
+                    "Server position from %s:\nThis device: %.2f%%\nServer: %.2f%%",
+                    device,
+                    local_percent * 100,
+                    remote_percent * 100
+                ),
+                ok_text = string.format("Use server (%.2f%%)", remote_percent * 100),
+                cancel_text = string.format("Keep local (%.2f%%)", local_percent * 100),
+                ok_callback = function()
+                    original_syncToProgress(self, remote)
+                end,
+            })
+        end
+    end
 
     local safe_to_reconnect = false
-    local silent_connect_in_progress = false
+    local connecting = false
     local intentional_disconnect = false
 
-    -- On PocketBook, isOnline() means connected, not that the Wi-Fi radio is
-    -- enabled. An already-enabled radio can reconnect without a power-on prompt.
     local function wifiRadioIsOn()
         for _, ifname in ipairs({ "eth0", "wlan0" }) do
             local f = io.open("/sys/class/net/" .. ifname .. "/flags", "r")
@@ -209,1174 +392,215 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
 
     local function cleanupWifi()
         intentional_disconnect = true
-
-        logger.dbg(
-            "CWA offline queue: network work finished; afterWifiAction"
-        )
-
         NetworkMgr:afterWifiAction()
-
         UIManager:scheduleIn(2, function()
             intentional_disconnect = false
         end)
     end
 
-    ----------------------------------------------------------------
-    -- Queue flush
-    --
-    -- Sequential:
-    --
-    -- GET remote state
-    --   ↓
-    -- determine which state is newer
-    --   ↓
-    -- PUSH only when queued state is safe to apply
-    --
-    -- This prevents an old offline state from overwriting newer
-    -- progress made on another device.
-    ----------------------------------------------------------------
-
-    local function flushQueue(instance, done, preferred_key)
-        done = done or function() end
-
-        if STATE.queue_flushing then
-            table.insert(STATE.queue_waiters, done)
-            return
-        end
-
-        if not instance
-            or not instance.settings
-            or not instance.settings.server
-            or not instance.settings.username
-            or not instance.settings.password
-        then
-            done(false)
-            return
-        end
-
-        if not NetworkMgr:isOnline() then
-            done(false)
-            return
-        end
-
-        local server = instance.settings.server
-        local username = instance.settings.username
-        local password = instance.settings.password
-        local service_spec = instance.path .. "/api.json"
-
-        local initial_queue = getQueue()
-        local skipped = {}
-
-        local first_key = findMatchingItem(
-            initial_queue,
-            server,
-            username,
-            skipped,
-            preferred_key
-        )
-
-        if not first_key then
-            done(true)
-            return
-        end
-
-        STATE.queue_flushing = true
-        STATE.queue_waiters = { done }
-
-        logger.dbg(
-            "CWA offline queue: starting flush"
-        )
-
-        local finished = false
-
-        local function finishFlush(success)
-            if finished then
-                return
-            end
-
-            finished = true
-            STATE.queue_flushing = false
-
-            local waiters = STATE.queue_waiters
-            STATE.queue_waiters = {}
-
-            logger.dbg(
-                "CWA offline queue: flush finished",
-                success
-            )
-
-            for _, waiter in ipairs(waiters) do
-                local ok, err = pcall(waiter, success)
-
-                if not ok then
-                    logger.warn(
-                        "CWA offline queue: waiter failed:",
-                        err
-                    )
-                end
-            end
-        end
-
-        local processNext
-
-        ------------------------------------------------------------
-        -- Push one item
-        ------------------------------------------------------------
-
-        local function pushItem(key, item)
-            if not NetworkMgr:isOnline() then
-                finishFlush(false)
-                return
-            end
-
-            logger.dbg(
-                "CWA offline queue: pushing",
-                item.document,
-                item.percentage
-            )
-
-            local client = CWASyncClient:new{
-                service_url = server .. "/kosync",
-                service_spec = service_spec,
-            }
-
-            -- Prevent our generic client wrapper from mistaking this
-            -- direct queue request for the current-book operation.
-            client._cwasync_queue_request = true
-
-            local ok, err = pcall(
-                client.update_progress,
-                client,
-                username,
-                password,
-                item.document,
-                item.progress,
-                item.percentage,
-                item.device or Device.model,
-                item.device_id or instance.device_id,
-                function(success, body)
-                    if not success then
-                        logger.warn(
-                            "CWA offline queue: push failed; keeping item",
-                            item.document
-                        )
-
-                        finishFlush(false)
-                        return
-                    end
-
-                    logger.dbg(
-                        "CWA offline queue: push succeeded",
-                        item.document
-                    )
-
-                    removeQueueItemIfMatches(
-                        key,
-                        item.queued_at,
-                        item.progress,
-                        item.percentage
-                    )
-                    processNext()
-                end
-            )
-
-            if not ok then
-                logger.warn(
-                    "CWA offline queue: error starting push:",
-                    err
-                )
-
-                finishFlush(false)
-            end
-        end
-
-        ------------------------------------------------------------
-        -- Process next pending book
-        ------------------------------------------------------------
-
-        processNext = function()
-            if not NetworkMgr:isOnline() then
-                finishFlush(false)
-                return
-            end
-
-            local queue = getQueue()
-
-            local key, item = findMatchingItem(
-                queue,
-                server,
-                username,
-                skipped,
-                preferred_key
-            )
-
-            -- Preferred item only needs preference once.
-            preferred_key = nil
-
-            if not key then
-                finishFlush(true)
-                return
-            end
-
-            logger.dbg(
-                "CWA offline queue: checking remote state for",
-                item.document
-            )
-
-            local client = CWASyncClient:new{
-                service_url = server .. "/kosync",
-                service_spec = service_spec,
-            }
-
-            client._cwasync_queue_request = true
-
-            local ok, err = pcall(
-                client.get_progress,
-                client,
-                username,
-                password,
-                item.document,
-                function(success, body)
-                    ------------------------------------------------
-                    -- Network/server problem.
-                    --
-                    -- Keep everything and wait for the next
-                    -- opportunity.
-                    ------------------------------------------------
-
-                    if not success then
-                        logger.warn(
-                            "CWA offline queue: remote check failed; keeping item",
-                            item.document
-                        )
-
-                        finishFlush(false)
-                        return
-                    end
-
-                    ------------------------------------------------
-                    -- CWA itself treats a non-table response as an
-                    -- invalid/error response.
-                    ------------------------------------------------
-
-                    if type(body) ~= "table" then
-                        logger.warn(
-                            "CWA offline queue: invalid remote response; keeping item",
-                            item.document
-                        )
-
-                        finishFlush(false)
-                        return
-                    end
-
-                    ------------------------------------------------
-                    -- No percentage = CWA has no progress for this
-                    -- document.
-                    --
-                    -- Safe to upload our queued state.
-                    ------------------------------------------------
-
-                    if body.percentage == nil then
-                        logger.dbg(
-                            "CWA offline queue: no remote progress; pushing",
-                            item.document
-                        )
-
-                        pushItem(key, item)
-                        return
-                    end
-
-                    ------------------------------------------------
-                    -- Percentage exists but progress doesn't:
-                    -- malformed state. Never overwrite blindly.
-                    ------------------------------------------------
-
-                    if body.progress == nil then
-                        logger.warn(
-                            "CWA offline queue: malformed remote state; keeping item",
-                            item.document
-                        )
-
-                        finishFlush(false)
-                        return
-                    end
-
-                    ------------------------------------------------
-                    -- Exact same reading position already exists.
-                    ------------------------------------------------
-
-                    if tostring(body.progress)
-                        == tostring(item.progress)
-                    then
-                        logger.dbg(
-                            "CWA offline queue: remote already matches",
-                            item.document
-                        )
-
-                        removeQueueItem(key)
-                        processNext()
-                        return
-                    end
-
-                    ------------------------------------------------
-                    -- Modern CWA server:
-                    --
-                    -- Compare server timestamp with the time at
-                    -- which we captured the offline close.
-                    --
-                    -- Stock CWA uses the server timestamp against
-                    -- os.time()-based local reading timestamps too.
-                    ------------------------------------------------
-
-                    local remote_timestamp =
-                        tonumber(body.timestamp)
-
-                    local queued_timestamp =
-                        tonumber(item.queued_at)
-
-                    if remote_timestamp
-                        and queued_timestamp
-                    then
-                        if remote_timestamp
-                            > queued_timestamp
-                        then
-                            ----------------------------------------
-                            -- Another state reached CWA after our
-                            -- offline close. Remote wins.
-                            ----------------------------------------
-
-                            logger.dbg(
-                                "CWA offline queue: remote state newer; discarding stale queue item",
-                                item.document
-                            )
-
-                            removeQueueItem(key)
-                            processNext()
-                            return
-                        end
-
-                        if remote_timestamp
-                            == queued_timestamp
-                            and (
-                                body.device ~= item.device
-                                or body.device_id
-                                    ~= item.device_id
-                            )
-                        then
-                            ----------------------------------------
-                            -- Same timestamp from another device.
-                            -- Conservative choice: remote wins.
-                            ----------------------------------------
-
-                            logger.dbg(
-                                "CWA offline queue: timestamp tie from another device; remote wins",
-                                item.document
-                            )
-
-                            removeQueueItem(key)
-                            processNext()
-                            return
-                        end
-
-                        --------------------------------------------
-                        -- Our queued close is newer, or the same
-                        -- timestamp belongs to this same device.
-                        --------------------------------------------
-
-                        pushItem(key, item)
-                        return
-                    end
-
-                    ------------------------------------------------
-                    -- Legacy server without timestamps.
-                    --
-                    -- If the remote state belongs to THIS device,
-                    -- the queued close is known to be later local
-                    -- state which failed to reach CWA.
-                    ------------------------------------------------
-
-                    if body.device == item.device
-                        and body.device_id == item.device_id
-                    then
-                        logger.dbg(
-                            "CWA offline queue: legacy server, same device; pushing",
-                            item.document
-                        )
-
-                        pushItem(key, item)
-                        return
-                    end
-
-                    ------------------------------------------------
-                    -- Legacy server + different device:
-                    --
-                    -- We cannot safely know which position is newer.
-                    -- Keep this item for later, but don't let it
-                    -- block syncing unrelated queued books.
-                    ------------------------------------------------
-
-                    logger.warn(
-                        "CWA offline queue: cannot safely order legacy remote state; leaving item queued",
-                        item.document
-                    )
-
-                    skipped[key] = true
-                    processNext()
-                end
-            )
-
-            if not ok then
-                logger.warn(
-                    "CWA offline queue: error starting remote check:",
-                    err
-                )
-
-                finishFlush(false)
-            end
-        end
-
-        processNext()
-    end
-
-    ----------------------------------------------------------------
-    -- Watch exactly one normal CWA HTTP request.
-    --
-    -- This lets us run:
-    --
-    -- current book sync
-    --     ↓
-    -- pending queue
-    --     ↓
-    -- afterWifiAction()
-    --
-    -- only after the actual asynchronous CWA request completed.
-    ----------------------------------------------------------------
-
-    if not CWASyncClient._offline_queue_client_wrapped then
-        CWASyncClient._offline_queue_client_wrapped = true
-
-        local original_push = CWASyncClient.update_progress
-        local original_pull = CWASyncClient.get_progress
-
-        CWASyncClient.update_progress = function(
-            client,
-            username,
-            password,
-            document,
-            progress,
-            percentage,
-            device,
-            device_id,
-            callback
-        )
-            local session = nil
-
-            if not client._cwasync_queue_request
-                and STATE.next_request_session
-            then
-                session = STATE.next_request_session
-                STATE.next_request_session = nil
-            end
-
-            local wrapped_callback = callback
-
-            if session then
-                wrapped_callback = function(ok, body)
-                    if callback then
-                        callback(ok, body)
-                    end
-
-                    session.done(ok, body)
-                end
-            end
-
-            local ok, result = pcall(
-                original_push,
-                client,
-                username,
-                password,
-                document,
-                progress,
-                percentage,
-                device,
-                device_id,
-                wrapped_callback
-            )
-
-            if not ok then
-                if session then
-                    session.done(false, nil)
-                end
-
-                error(result)
-            end
-
-            return result
-        end
-
-        CWASyncClient.get_progress = function(
-            client,
-            username,
-            password,
-            document,
-            callback
-        )
-            local session = nil
-
-            if not client._cwasync_queue_request
-                and STATE.next_request_session
-            then
-                session = STATE.next_request_session
-                STATE.next_request_session = nil
-            end
-
-            local wrapped_callback = callback
-
-            if session then
-                wrapped_callback = function(ok, body)
-                    if callback then
-                        callback(ok, body)
-                    end
-
-                    session.done(ok, body)
-                end
-            end
-
-            local ok, result = pcall(
-                original_pull,
-                client,
-                username,
-                password,
-                document,
-                wrapped_callback
-            )
-
-            if not ok then
-                if session then
-                    session.done(false, nil)
-                end
-
-                error(result)
-            end
-
-            return result
-        end
-    end
-
-    ----------------------------------------------------------------
-    -- Run a current-book CWA operation.
-    --
-    -- cleanup_after:
-    --   true  -> queue, then afterWifiAction()
-    --   false -> queue, but leave current network state alone
-    --
-    -- The false case is useful for an externally-established
-    -- NetworkConnected event.
-    ----------------------------------------------------------------
-
-    local function runManagedOperation(
-        instance,
-        operation,
-        cleanup_after
-    )
-        local completed = false
-
-        local function finish(ok)
-            if completed then
-                return
-            end
-
-            completed = true
-
-            if not ok then
-                if cleanup_after then
-                    cleanupWifi()
-                end
-
-                return
-            end
-
-            flushQueue(instance, function()
-                if cleanup_after then
-                    cleanupWifi()
-                end
-            end)
-        end
-
-        STATE.next_request_session = {
-            done = function(ok, body)
-                finish(ok)
-            end,
-        }
-
-        local ok, err = pcall(operation)
-
-        if not ok then
-            logger.warn(
-                "CWA offline queue: managed CWA operation failed:",
-                err
-            )
-
-            STATE.next_request_session = nil
-            finish(false)
-            return
-        end
-
-        ------------------------------------------------------------
-        -- No HTTP request consumed the one-shot session.
-        --
-        -- This happens when CWA debounces the call, has no digest,
-        -- etc. We still have a valid network session, so use it to
-        -- flush old pending books.
-        ------------------------------------------------------------
-
-        if STATE.next_request_session then
-            STATE.next_request_session = nil
-
-            flushQueue(instance, function()
-                if cleanup_after then
-                    cleanupWifi()
-                end
-            end)
-        end
-    end
-
-    ----------------------------------------------------------------
-    -- Silent PocketBook networking
-    ----------------------------------------------------------------
-
     local function silentlyGetOnline(callback)
         if NetworkMgr:isOnline() then
             safe_to_reconnect = true
-
-            --------------------------------------------------------
-            -- Preserve the behavior you liked:
-            -- "Action when done with Wi-Fi" still applies even when
-            -- the connection was already up.
-            --------------------------------------------------------
-
             NetworkMgr:setBeforeActionFlag()
-
             callback(true)
             return
         end
-
-        ------------------------------------------------------------
-        -- CRITICAL:
-        --
-        -- Don't call WiFiPower(1) unless we already KNOW this is a
-        -- connection KOReader previously disconnected itself.
-        --
-        -- When PocketBook Wi-Fi is genuinely off, this returns
-        -- silently with zero dialog.
-        ------------------------------------------------------------
-
-        if not safe_to_reconnect and not wifiRadioIsOn() then
-            logger.dbg(
-                "CWA offline queue: offline; reconnect not known safe, skipping"
-            )
-
+        if connecting or (not safe_to_reconnect and not wifiRadioIsOn()) then
             callback(false)
             return
         end
 
-        if silent_connect_in_progress then
-            logger.dbg(
-                "CWA offline queue: silent connection already in progress"
-            )
-
-            callback(false)
-            return
-        end
-
-        silent_connect_in_progress = true
-
+        connecting = true
         NetworkMgr:setBeforeActionFlag()
-
-        logger.dbg(
-            "CWA offline queue: silently reconnecting known Wi-Fi session"
-        )
-
         local attempts = 0
-        local max_attempts = 12 -- ~6 seconds
         local finished = false
-
+        local check_scheduled = false
         local function finish(success)
             if finished then
                 return
             end
-
             finished = true
-            silent_connect_in_progress = false
-
-            if success then
-                safe_to_reconnect = true
-
-                logger.dbg(
-                    "CWA offline queue: silent reconnect succeeded"
-                )
-
-                callback(true)
-                return
+            connecting = false
+            safe_to_reconnect = success
+            if not success then
+                cleanupWifi()
             end
-
-            --------------------------------------------------------
-            -- A known-safe reconnect stopped being safe.
-            --
-            -- Most importantly, never keep hammering the PocketBook
-            -- Wi-Fi dialog.
-            --------------------------------------------------------
-
-            safe_to_reconnect = false
-
-            logger.dbg(
-                "CWA offline queue: reconnect failed; disabling automatic retries"
-            )
-
-            cleanupWifi()
-            callback(false)
+            callback(success)
         end
-
-        local check_scheduled = false
-
-        local function checkConnection()
+        local function check()
             if finished then
                 return
             end
-
             attempts = attempts + 1
-
             if NetworkMgr:isOnline() then
                 finish(true)
-                return
-            end
-
-            if attempts >= max_attempts then
+            elseif attempts >= 12 then
                 finish(false)
-                return
+            else
+                check_scheduled = true
+                UIManager:scheduleIn(0.5, function()
+                    check_scheduled = false
+                    check()
+                end)
             end
-
-            check_scheduled = true
-            UIManager:scheduleIn(0.5, function()
-                check_scheduled = false
-                checkConnection()
-            end)
         end
-
-        local function scheduleConnectionCheck()
-            if finished or check_scheduled then
-                return
+        local function scheduleCheck()
+            if not finished and not check_scheduled then
+                check_scheduled = true
+                UIManager:scheduleIn(0.5, function()
+                    check_scheduled = false
+                    check()
+                end)
             end
-
-            check_scheduled = true
-            UIManager:scheduleIn(0.5, function()
-                check_scheduled = false
-                checkConnection()
-            end)
         end
-
-        local status = NetworkMgr:turnOnWifi(function()
-            scheduleConnectionCheck()
-        end)
-
-        -- PocketBook may not invoke the callback when its prompt disappears.
-        -- Start the watchdog regardless so the attempt cannot remain stuck.
-        scheduleConnectionCheck()
-
+        local status = NetworkMgr:turnOnWifi(scheduleCheck)
+        -- PocketBook can dismiss its prompt without invoking the callback.
+        scheduleCheck()
         if status == false then
             finish(false)
         end
     end
 
-    local function queueAndFlushCurrentProgress(instance, reason)
-        local key = queueCurrentProgress(instance, reason)
-
-        if not key then
+    local function pullWithChoice(instance, cleanup_after)
+        if state.pulling then
             return
         end
-
-        if silent_connect_in_progress then
-            logger.dbg(
-                "CWA offline queue: deferring " .. reason .. " flush during silent connection"
-            )
-            return
+        state.pulling = true
+        local cleanup = cleanup_after and cleanupWifi or function() end
+        local original_sync_forward = instance.settings.sync_forward
+        local original_sync_backward = instance.settings.sync_backward
+        local pull = {
+            instance = instance,
+            local_percentage = instance:getLastPercent(),
+        }
+        local finished = false
+        local function finishPull()
+            if finished then
+                return
+            end
+            finished = true
+            state.pulling = false
+            if state.pull == pull then
+                state.pull = nil
+            end
+            instance.settings.sync_forward = original_sync_forward
+            instance.settings.sync_backward = original_sync_backward
+            cleanup()
         end
 
+        -- Let syncToProgress present one consistent choice for either direction.
+        instance.settings.sync_forward = CWA_SYNC_SILENT
+        instance.settings.sync_backward = CWA_SYNC_SILENT
+        state.pull = pull
+        state.after_pull = finishPull
+        instance:getProgress(false, false)
+        UIManager:scheduleIn(10, function()
+            if state.after_pull == finishPull then
+                state.after_pull = nil
+                finishPull()
+            end
+        end)
+    end
+
+    local function syncWhenOnline(instance, pull_after, resolve_current, cleanup_after)
         silentlyGetOnline(function(online)
             if not online then
                 return
             end
-
-            flushQueue(
-                instance,
-                function()
+            flushQueue(instance, function(success)
+                if not success then
+                    if cleanup_after then
+                        cleanupWifi()
+                    end
+                elseif pull_after then
+                    pullWithChoice(instance, cleanup_after)
+                elseif cleanup_after then
                     cleanupWifi()
-                end,
-                key
-            )
+                end
+            end, nil, resolve_current)
         end)
     end
 
-    ----------------------------------------------------------------
-    -- Install lifecycle handlers only once
-    ----------------------------------------------------------------
+    local function queueAndFlush(instance, reason, cleanup_after)
+        local key = queueCurrentProgress(instance, reason)
+        if not key or connecting then
+            return
+        end
+        silentlyGetOnline(function(online)
+            if online then
+                flushQueue(instance, function()
+                    if cleanup_after then
+                        cleanupWifi()
+                    end
+                end, key, false)
+            end
+        end)
+    end
 
     if CWASync._offline_queue_handlers_wrapped then
         return
     end
-
     CWASync._offline_queue_handlers_wrapped = true
 
-    ----------------------------------------------------------------
-    -- Reader ready
-    ----------------------------------------------------------------
-
-    local original_onReaderReady =
-        CWASync.onReaderReady
-
+    local original_onReaderReady = CWASync.onReaderReady
     CWASync.onReaderReady = function(self)
-        STATE.instance = self
-
         if NetworkMgr:isOnline() then
             safe_to_reconnect = true
         end
-
         if not self.settings.auto_sync then
             return original_onReaderReady(self)
         end
 
-        ------------------------------------------------------------
-        -- Let stock CWA do all normal reader initialization while
-        -- suppressing ONLY its automatic networking attempt.
-        ------------------------------------------------------------
-
-        local auto_sync =
-            self.settings.auto_sync
-
         self.settings.auto_sync = false
-
         original_onReaderReady(self)
-
-        self.settings.auto_sync = auto_sync
+        self.settings.auto_sync = true
         self:registerEvents()
-
-        silentlyGetOnline(function(online)
-            if not online then
-                return
-            end
-
-            runManagedOperation(
-                self,
-                function()
-                    self:getProgress(false, false)
-                end,
-                true
-            )
-        end)
+        syncWhenOnline(self, true, true, true)
     end
-
-    ----------------------------------------------------------------
-    -- Resume
-    ----------------------------------------------------------------
 
     CWASync._onResume = function(self)
-        STATE.instance = self
-
-        logger.dbg(
-            "CWA offline queue: onResume"
-        )
-
-        ------------------------------------------------------------
-        -- PocketBook networking itself can generate Suspend/Resume.
-        ------------------------------------------------------------
-
-        if silent_connect_in_progress then
-            logger.dbg(
-                "CWA offline queue: ignoring Resume during silent connection"
-            )
-
-            return
+        if not connecting then
+            syncWhenOnline(self, true, true, true)
         end
-
-        silentlyGetOnline(function(online)
-            if not online then
-                return
-            end
-
-            runManagedOperation(
-                self,
-                function()
-                    self:getProgress(false, false)
-                end,
-                true
-            )
-        end)
     end
 
-    ----------------------------------------------------------------
-    -- Suspend
-    ----------------------------------------------------------------
-
     CWASync.onIdleSync = function(self)
-        STATE.instance = self
-
-        logger.dbg(
-            "CWA offline queue: onIdleSync"
-        )
-
-        queueAndFlushCurrentProgress(self, "idle")
+        queueAndFlush(self, "idle", true)
     end
 
     CWASync._onSuspend = function(self)
-        STATE.instance = self
-
-        logger.dbg(
-            "CWA offline queue: onSuspend"
-        )
-
-        local key = queueCurrentProgress(self, "suspend")
-
-        if not key then
-            return
-        end
-
-        if silent_connect_in_progress then
-            logger.dbg(
-                "CWA offline queue: deferring suspend push during silent connection"
-            )
-            return
-        end
-
-        silentlyGetOnline(function(online)
-            if not online then
-                return
-            end
-
-            -- Retain CWA's normal suspend push. The saved queue entry is
-            -- flushed after its callback or retried on a later connection.
-            runManagedOperation(
-                self,
-                function()
-                    self:updateProgress(false, false, false)
-                end,
-                true
-            )
-        end)
+        queueAndFlush(self, "suspend", true)
     end
-
-    ----------------------------------------------------------------
-    -- Close document
-    ----------------------------------------------------------------
 
     CWASync._onCloseDocument = function(self)
-        STATE.instance = self
-
-        logger.dbg(
-            "CWA offline queue: onCloseDocument"
-        )
-
-        ------------------------------------------------------------
-        -- Prevent PocketBook focus/network events from initiating
-        -- more document operations during teardown.
-        ------------------------------------------------------------
-
         self.onResume = nil
         self.onSuspend = nil
-
-        -- Capture everything before the document object disappears.
-        local key = queueCurrentProgress(self, "close")
-
-        if not key then
-            return
-        end
-
-        ------------------------------------------------------------
-        -- If Wi-Fi genuinely isn't available/allowed, this simply
-        -- returns. The queued state remains safely on disk.
-        ------------------------------------------------------------
-
-        silentlyGetOnline(function(online)
-            if not online then
-                return
-            end
-
-            --------------------------------------------------------
-            -- Current closed book gets priority.
-            --
-            -- No live document object is needed anymore.
-            --------------------------------------------------------
-
-            flushQueue(
-                self,
-                function()
-                    cleanupWifi()
-                end,
-                key
-            )
-        end)
+        queueAndFlush(self, "close", true)
     end
-
-    ----------------------------------------------------------------
-    -- Network connected
-    ----------------------------------------------------------------
-
-    local original_onNetworkDisconnecting =
-        CWASync._onNetworkDisconnecting
 
     CWASync._onNetworkConnected = function(self)
-        STATE.instance = self
         safe_to_reconnect = true
-
-        logger.dbg(
-            "CWA offline queue: NetworkConnected"
-        )
-
-        ------------------------------------------------------------
-        -- Our own silent reconnect already has an operation waiting
-        -- for it. Don't launch CWA's duplicate pull.
-        ------------------------------------------------------------
-
-        if silent_connect_in_progress then
-            logger.dbg(
-                "CWA offline queue: suppressing duplicate NetworkConnected pull"
-            )
-
+        if connecting then
             return
         end
-
-        ------------------------------------------------------------
-        -- Match stock CWA's 0.5 s delay.
-        --
-        -- Because this network connection came from elsewhere, don't
-        -- automatically turn it off afterward. We still use it to
-        -- pull the current book and flush the pending queue.
-        ------------------------------------------------------------
-
         UIManager:scheduleIn(0.5, function()
-            if not NetworkMgr:isOnline() then
-                return
+            if NetworkMgr:isOnline() then
+                flushQueue(self, function(success)
+                    if success then
+                        pullWithChoice(self, false)
+                    end
+                end, nil, true)
             end
-
-            runManagedOperation(
-                self,
-                function()
-                    self:getProgress(false, false)
-                end,
-                false
-            )
         end)
     end
 
-    ----------------------------------------------------------------
-    -- Network disconnecting
-    ----------------------------------------------------------------
-
     CWASync._onNetworkDisconnecting = function(self)
-        STATE.instance = self
-
         if intentional_disconnect then
-            --------------------------------------------------------
-            -- This is our post-sync NetDisconnect().
-            --
-            -- Do not let stock CWA start another push while the
-            -- connection is being deliberately torn down.
-            --------------------------------------------------------
-
-            logger.dbg(
-                "CWA offline queue: intentional post-sync disconnect"
-            )
-
-            intentional_disconnect = false
-            safe_to_reconnect = true
-
             return
         end
-
-        ------------------------------------------------------------
-        -- Something outside us initiated the disconnect.
-        -- Don't assume we may turn Wi-Fi back on automatically.
-        ------------------------------------------------------------
-
-        logger.dbg(
-            "CWA offline queue: external disconnect; clearing reconnect permission"
-        )
-
         safe_to_reconnect = false
-
-        return original_onNetworkDisconnecting(self)
+        -- Stock CWA pushes directly while the connection is disappearing.
+        -- Persist it instead so a different remote position is never replaced.
+        queueCurrentProgress(self, "network disconnect")
     end
 end)
-
---[=[
--- Disabled until KOReader's autosuspend timeout is configured deliberately.
--- Normal CWA suspend handling above remains active.
-userpatch.registerPatchPluginFunc("autosuspend", function(AutoSuspend)
-    local Event = require("ui/event")
-    local UIManager = require("ui/uimanager")
-    local logger = require("logger")
-
-    local IDLE_SYNC_LEAD_SECONDS = 60
-
-    if AutoSuspend._cwasync_idle_sync_wrapped then
-        return
-    end
-
-    AutoSuspend._cwasync_idle_sync_wrapped = true
-
-    local original_start = AutoSuspend._start
-    local original_unschedule = AutoSuspend._unschedule
-    local original_on_input_event = AutoSuspend.onInputEvent
-
-    local function cancelIdleSync(self)
-        if self._cwasync_idle_sync_task then
-            UIManager:unschedule(self._cwasync_idle_sync_task)
-            self._cwasync_idle_sync_task = nil
-        end
-    end
-
-    local function scheduleIdleSync(self)
-        cancelIdleSync(self)
-
-        if not self:_enabled() then
-            return
-        end
-
-        local delay =
-            self.auto_suspend_timeout_seconds
-            - IDLE_SYNC_LEAD_SECONDS
-
-        if delay <= 0 then
-            return
-        end
-
-        self._cwasync_idle_sync_task = function()
-            self._cwasync_idle_sync_task = nil
-
-            logger.dbg("AutoSuspend: starting idle sync")
-            UIManager:broadcastEvent(Event:new("IdleSync"))
-        end
-
-        UIManager:scheduleIn(
-            delay,
-            self._cwasync_idle_sync_task
-        )
-    end
-
-    AutoSuspend._start = function(self, ...)
-        local result = original_start(self, ...)
-        scheduleIdleSync(self)
-        return result
-    end
-
-    AutoSuspend._unschedule = function(self, ...)
-        cancelIdleSync(self)
-        return original_unschedule(self, ...)
-    end
-
-    AutoSuspend.onInputEvent = function(self, ...)
-        local result = original_on_input_event(self, ...)
-        scheduleIdleSync(self)
-        return result
-    end
-end)
-]=]

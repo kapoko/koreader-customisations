@@ -1,8 +1,6 @@
 # KOReader customisations
 
-This repository contains personal KOReader additions. It does not manage the
-current reader and never connects to it unless explicitly supplied as a deployment
-target.
+This repository contains personal KOReader additions for my Pocketbook.
 
 ## Layout
 
@@ -13,16 +11,32 @@ target.
 The `.gitkeep` files only preserve empty directories in Git and are excluded
 from deployment.
 
-## Add customizations
+## CWA sync rules
 
-Put each patch in `patches/` and font files (or per-font directories) in
-`fonts/`. Then review and commit them normally:
+Added behaviors:
 
-```sh
-git status
-git add patches fonts
-git commit -m "Add KOReader customizations"
-```
+- Suspend, document close, and network disconnect save progress before any
+  network work; an unavailable connection leaves that snapshot queued.
+- Queue entries are per server, account, and document. Once online, automatic
+  sync processes all matching queued books sequentially; an unresolved conflict
+  stays queued without blocking other books.
+- Opening a document reconciles queued progress with the server before doing
+  CWA's normal pull, whenever Wi-Fi is available.
+- Queue reconciliation trusts timestamps. A newer local snapshot is uploaded
+  automatically unless the server is farther ahead; tied or unavailable
+  timestamps favor the authoritative server. When the server wins for an open
+  book, the reader chooses `Use server (xx.xx%)` or `Keep local (xx.xx%)`.
+  Destructive closed-document conflicts remain queued.
+- Automatic server pulls with a different position always offer `Use server
+  (xx.xx%)` and `Keep local (xx.xx%)`, showing both positions.
+- Already-online Wi-Fi is used. When KOReader is offline but the PocketBook
+  radio is enabled, automatic sync attempts to reconnect even without an
+  earlier successful connection.
+- When the PocketBook radio is off, automatic sync fails silently and does not
+  invoke its Wi-Fi prompt. A dismissed prompt is treated the same way when it
+  leaves the radio off.
+- An external Wi-Fi disconnect revokes automatic reconnect permission; the
+  next attempt may still reconnect if the radio is enabled.
 
 ## Deploy to a new device
 
