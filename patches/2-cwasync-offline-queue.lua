@@ -8,7 +8,6 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local band = require("bit").band
     local logger = require("logger")
     local md5 = require("ffi/sha2").md5
-    local SyncLogic = require("sync_logic")
 
     local CWASyncClient = require("CWASyncClient")
     local QUEUE_KEY = "cwasync_pending_progress_queue"
@@ -119,7 +118,6 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         local local_percent = tonumber(item.percentage)
         local remote_percent = tonumber(body.percentage)
         local device = body.device or "another device"
-        local remote = SyncLogic.resolveRemotePosition(body)
 
         if not local_percent or not remote_percent then
             logger.warn("CWA queue: invalid conflict percentage", item.document)
@@ -161,7 +159,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             cancel_text = string.format("Keep local (%.2f%%)", local_percent * 100),
             ok_callback = function()
                 removeQueueItem(key, item)
-                instance:syncToProgress(remote)
+                instance:syncToProgress(body.progress)
                 done()
             end,
             cancel_callback = keepLocal,
@@ -269,11 +267,9 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                         return
                     end
 
-                    local remote = SyncLogic.resolveRemotePosition(body)
                     local local_percent = tonumber(item.percentage)
                     local remote_percent = tonumber(body.percentage)
-                    if body.progress == nil or remote.kind == "none"
-                        or not local_percent or not remote_percent then
+                    if body.progress == nil or not local_percent or not remote_percent then
                         markConflict(key, item, body)
                         skipped[key] = true
                         processNext()
@@ -342,17 +338,17 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     if not CWASync._offline_queue_sync_wrapped then
         CWASync._offline_queue_sync_wrapped = true
         local original_syncToProgress = CWASync.syncToProgress
-        CWASync.syncToProgress = function(self, remote)
+        CWASync.syncToProgress = function(self, progress)
             local pull = state.pull
             if not pull or pull.instance ~= self or type(pull.body) ~= "table" then
-                return original_syncToProgress(self, remote)
+                return original_syncToProgress(self, progress)
             end
 
             state.pull = nil
             local local_percent = tonumber(pull.local_percentage)
             local remote_percent = tonumber(pull.body.percentage)
             if not local_percent or not remote_percent then
-                return original_syncToProgress(self, remote)
+                return original_syncToProgress(self, progress)
             end
 
             local device = pull.body.device or "another device"
@@ -366,7 +362,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                 ok_text = string.format("Use server (%.2f%%)", remote_percent * 100),
                 cancel_text = string.format("Keep local (%.2f%%)", local_percent * 100),
                 ok_callback = function()
-                    original_syncToProgress(self, remote)
+                    original_syncToProgress(self, progress)
                 end,
             })
         end
