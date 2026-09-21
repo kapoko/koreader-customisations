@@ -13,30 +13,17 @@ from deployment.
 
 ## CWA sync rules
 
-Added behaviors:
-
-- Suspend, document close, and network disconnect save progress before any
-  network work; an unavailable connection leaves that snapshot queued.
-- Queue entries are per server, account, and document. Once online, automatic
-  sync processes all matching queued books sequentially; an unresolved conflict
-  stays queued without blocking other books.
-- Opening a document reconciles queued progress with the server before doing
-  CWA's normal pull, whenever Wi-Fi is available.
-- Queue reconciliation trusts timestamps. A newer local snapshot is uploaded
-  automatically unless the server is farther ahead; tied or unavailable
-  timestamps favor the authoritative server. When the server wins for an open
-  book, the reader chooses `Use server (xx.xx%)` or `Keep local (xx.xx%)`.
-  Destructive closed-document conflicts remain queued.
-- Automatic server pulls with a different position always offer `Use server
-  (xx.xx%)` and `Keep local (xx.xx%)`, showing both positions.
-- Already-online Wi-Fi is used. When KOReader is offline but the PocketBook
-  radio is enabled, automatic sync attempts to reconnect even without an
-  earlier successful connection.
-- When the PocketBook radio is off, automatic sync fails silently and does not
-  invoke its Wi-Fi prompt. A dismissed prompt is treated the same way when it
-  leaves the radio off.
-- An external Wi-Fi disconnect revokes automatic reconnect permission; the
-  next attempt may still reconnect if the radio is enabled.
+- Suspend, close, and network disconnect queue progress before network work.
+  Once online, all queued books for the server/account are processed.
+- Queue reconciliation trusts timestamps. A newer local snapshot uploads
+  automatically unless the server is farther ahead; ties and missing timestamps
+  favor the server. Closed destructive conflicts stay queued.
+- On an open book, automatic server progress always offers `Use server
+  (xx.xx%)` or `Keep local (xx.xx%)`, showing both positions.
+- Use an existing connection, or reconnect when the PocketBook radio is on.
+  When the radio is off, fail silently without showing a Wi-Fi prompt.
+- An external disconnect revokes reconnect permission; a later attempt may
+  reconnect if the radio is still on.
 
 ## Deploy to a new device
 
