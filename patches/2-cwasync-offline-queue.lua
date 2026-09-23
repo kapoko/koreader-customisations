@@ -5,7 +5,6 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     local Device = require("device")
     local NetworkMgr = require("ui/network/manager")
     local UIManager = require("ui/uimanager")
-    local band = require("bit").band
     local logger = require("logger")
     local md5 = require("ffi/sha2").md5
 
@@ -310,6 +309,58 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         processNext()
     end
 
+    local function showPullChoice(instance, pull, progress)
+        if pull.prompted then
+            return
+        end
+        pull.prompted = true
+
+        local local_percent = tonumber(pull.local_percentage)
+        local remote_percent = tonumber(pull.body.percentage)
+        if progress == nil or not local_percent or not remote_percent then
+            pull.finish()
+            return
+        end
+
+        local device = pull.body.device or "another device"
+        local function keepLocal()
+            local settings = instance.settings
+            local client = CWASyncClient:new{
+                service_url = settings.server .. "/kosync",
+                service_spec = instance.path .. "/api.json",
+            }
+            local ok, err = pcall(client.update_progress, client,
+                settings.username, settings.password, pull.document,
+                pull.local_progress, pull.local_percentage, Device.model, instance.device_id,
+                function(success)
+                    if not success then
+                        logger.warn("CWA queue: chosen local push failed", pull.document)
+                    end
+                    pull.finish()
+                end)
+            if not ok then
+                logger.warn("CWA queue: could not start chosen local push", err)
+                pull.finish()
+            end
+        end
+
+        UIManager:show(ConfirmBox:new{
+            text = string.format(
+                "Server position from %s:\nThis device: %.2f%%\nServer: %.2f%%",
+                device,
+                local_percent * 100,
+                remote_percent * 100
+            ),
+            ok_text = string.format("Use server (%.2f%%)", remote_percent * 100),
+            cancel_text = string.format("Keep local (%.2f%%)", local_percent * 100),
+            ok_callback = function()
+                pull.original_sync(instance, progress)
+                pull.finish()
+            end,
+            cancel_callback = keepLocal,
+        })
+    end
+
     if not CWASyncClient._offline_queue_pull_wrapped then
         CWASyncClient._offline_queue_pull_wrapped = true
         local original_get_progress = CWASyncClient.get_progress
@@ -328,63 +379,31 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
                     if callback then
                         callback(ok, body)
                     end
-                    if after_pull then
+                    if pull and state.pull == pull and ok and type(body) == "table" then
+                        showPullChoice(pull.instance, pull, body.progress)
+                    elseif after_pull then
                         after_pull()
                     end
                 end)
         end
     end
 
+    local original_sync_to_progress = CWASync.syncToProgress
     if not CWASync._offline_queue_sync_wrapped then
         CWASync._offline_queue_sync_wrapped = true
-        local original_syncToProgress = CWASync.syncToProgress
         CWASync.syncToProgress = function(self, progress)
             local pull = state.pull
             if not pull or pull.instance ~= self or type(pull.body) ~= "table" then
-                return original_syncToProgress(self, progress)
+                return original_sync_to_progress(self, progress)
             end
 
-            state.pull = nil
-            local local_percent = tonumber(pull.local_percentage)
-            local remote_percent = tonumber(pull.body.percentage)
-            if not local_percent or not remote_percent then
-                return original_syncToProgress(self, progress)
-            end
-
-            local device = pull.body.device or "another device"
-            UIManager:show(ConfirmBox:new{
-                text = string.format(
-                    "Server position from %s:\nThis device: %.2f%%\nServer: %.2f%%",
-                    device,
-                    local_percent * 100,
-                    remote_percent * 100
-                ),
-                ok_text = string.format("Use server (%.2f%%)", remote_percent * 100),
-                cancel_text = string.format("Keep local (%.2f%%)", local_percent * 100),
-                ok_callback = function()
-                    original_syncToProgress(self, progress)
-                end,
-            })
+            showPullChoice(self, pull, progress)
         end
     end
 
     local safe_to_reconnect = false
     local connecting = false
     local intentional_disconnect = false
-
-    local function wifiRadioIsOn()
-        for _, ifname in ipairs({ "eth0", "wlan0" }) do
-            local f = io.open("/sys/class/net/" .. ifname .. "/flags", "r")
-            if f then
-                local flags = tonumber(f:read("*l"))
-                f:close()
-                if flags and band(flags, 1) ~= 0 then
-                    return true
-                end
-            end
-        end
-        return false
-    end
 
     local function cleanupWifi()
         intentional_disconnect = true
@@ -401,7 +420,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             callback(true)
             return
         end
-        if connecting or (not safe_to_reconnect and not wifiRadioIsOn()) then
+        if connecting then
             callback(false)
             return
         end
@@ -457,6 +476,8 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         end
     end
 
+    local original_get_progress_method = CWASync.getProgress
+
     local function pullWithChoice(instance, cleanup_after)
         if state.pulling then
             return
@@ -467,7 +488,10 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         local original_sync_backward = instance.settings.sync_backward
         local pull = {
             instance = instance,
+            document = instance:getDocumentDigest(),
+            local_progress = instance:getLastProgress(),
             local_percentage = instance:getLastPercent(),
+            original_sync = original_sync_to_progress,
         }
         local finished = false
         local function finishPull()
@@ -483,19 +507,27 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             instance.settings.sync_backward = original_sync_backward
             cleanup()
         end
+        pull.finish = finishPull
 
         -- Let syncToProgress present one consistent choice for either direction.
         instance.settings.sync_forward = CWA_SYNC_SILENT
         instance.settings.sync_backward = CWA_SYNC_SILENT
         state.pull = pull
         state.after_pull = finishPull
-        instance:getProgress(false, false)
+        original_get_progress_method(instance, false, false)
         UIManager:scheduleIn(10, function()
             if state.after_pull == finishPull then
                 state.after_pull = nil
                 finishPull()
             end
         end)
+    end
+
+    CWASync.getProgress = function(self, ...)
+        if state.pulling then
+            return original_get_progress_method(self, ...)
+        end
+        return pullWithChoice(self, false)
     end
 
     local function syncWhenOnline(instance, pull_after, resolve_current, cleanup_after)

@@ -18,10 +18,11 @@ from deployment.
 - Queue reconciliation trusts timestamps. A newer local snapshot uploads
   automatically unless the server is farther ahead; ties and missing timestamps
   favor the server. Closed destructive conflicts stay queued.
-- On an open book, automatic server progress always offers `Use server
-  (xx.xx%)` or `Keep local (xx.xx%)`, showing both positions.
-- Use an existing connection, or reconnect when the PocketBook radio is on.
-  When the radio is off, fail silently without showing a Wi-Fi prompt.
+- On an open book, every server pull with a saved position offers `Use server
+  (xx.xx%)` or `Keep local (xx.xx%)`, showing both positions. Keeping local
+  uploads that choice to the server.
+- Startup and resume always attempt to check progress, including by turning on
+  Wi-Fi when needed.
 - An external disconnect revokes reconnect permission; a later attempt may
   reconnect if the radio is still on.
 
