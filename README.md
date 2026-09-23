@@ -20,7 +20,8 @@ from deployment.
   favor the server. Closed destructive conflicts stay queued.
 - On an open book, every server pull with a saved position offers `Use server
   (xx.xx%)` or `Keep local (xx.xx%)`, showing both positions. Keeping local
-  uploads that choice to the server.
+  uploads that choice to the server. An exact match from this device keeps
+  KOReader's normal already-current status instead.
 - Startup and resume always attempt to check progress, including by turning on
   Wi-Fi when needed.
 - An external disconnect revokes reconnect permission; a later attempt may

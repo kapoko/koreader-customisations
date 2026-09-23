@@ -313,6 +313,14 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         if pull.prompted then
             return
         end
+
+        if tostring(progress) == tostring(pull.local_progress)
+            and pull.body.device == Device.model
+            and tostring(pull.body.device_id) == tostring(instance.device_id) then
+            pull.finish()
+            return
+        end
+
         pull.prompted = true
 
         local local_percent = tonumber(pull.local_percentage)
