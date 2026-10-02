@@ -314,17 +314,22 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             return
         end
 
-        if tostring(progress) == tostring(pull.local_progress)
-            and pull.body.device == Device.model
-            and tostring(pull.body.device_id) == tostring(instance.device_id) then
+        local same_device = pull.body.device == Device.model
+            and tostring(pull.body.device_id) == tostring(instance.device_id)
+        local same_progress = tostring(progress) == tostring(pull.local_progress)
+        local remote_percent = tonumber(pull.body.percentage)
+        local local_percent = tonumber(pull.local_percentage)
+        local same_percentage = remote_percent and local_percent
+            and remote_percent == local_percent
+        -- KOReader handles these no-op manual pulls itself, including its notice.
+        if (not pull.interactive and same_progress and same_device)
+            or (pull.interactive and (same_progress or same_percentage or same_device)) then
             pull.finish()
             return
         end
 
         pull.prompted = true
 
-        local local_percent = tonumber(pull.local_percentage)
-        local remote_percent = tonumber(pull.body.percentage)
         if progress == nil or not local_percent or not remote_percent then
             pull.finish()
             return
@@ -486,7 +491,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
 
     local original_get_progress_method = CWASync.getProgress
 
-    local function pullWithChoice(instance, cleanup_after)
+    local function pullWithChoice(instance, cleanup_after, ensure_networking, interactive)
         if state.pulling then
             return
         end
@@ -500,6 +505,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
             local_progress = instance:getLastProgress(),
             local_percentage = instance:getLastPercent(),
             original_sync = original_sync_to_progress,
+            interactive = interactive,
         }
         local finished = false
         local function finishPull()
@@ -522,7 +528,7 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
         instance.settings.sync_backward = CWA_SYNC_SILENT
         state.pull = pull
         state.after_pull = finishPull
-        original_get_progress_method(instance, false, false)
+        original_get_progress_method(instance, ensure_networking, interactive)
         UIManager:scheduleIn(10, function()
             if state.after_pull == finishPull then
                 state.after_pull = nil
@@ -532,10 +538,11 @@ userpatch.registerPatchPluginFunc("cwasync", function(CWASync)
     end
 
     CWASync.getProgress = function(self, ensure_networking, interactive)
-        if state.pulling or interactive then
+        -- Preserve KOReader's networking UI for a manual pull started offline.
+        if state.pulling or (interactive and not NetworkMgr:isOnline()) then
             return original_get_progress_method(self, ensure_networking, interactive)
         end
-        return pullWithChoice(self, false)
+        return pullWithChoice(self, false, ensure_networking, interactive)
     end
 
     local function syncWhenOnline(instance, pull_after, resolve_current, cleanup_after)

@@ -18,11 +18,10 @@ from deployment.
 - Queue reconciliation trusts timestamps. A newer local snapshot uploads
   automatically unless the server is farther ahead; ties and missing timestamps
   favor the server. Closed destructive conflicts stay queued.
-- On an open book, automatic server pulls with a saved position offer `Use server
+- On an open book, server pulls with a different saved position offer `Use server
   (xx.xx%)` or `Keep local (xx.xx%)`, showing both positions. Keeping local
   uploads that choice to the server. Automatic exact matches from this device
-  stay quiet; an interactive pull shows KOReader's normal already-current
-  notice instead.
+  stay quiet; an interactive no-op pull shows KOReader's normal notice instead.
 - Startup and resume always attempt to check progress, including by turning on
   Wi-Fi when needed.
 - An external disconnect revokes reconnect permission; a later attempt may
