@@ -46,6 +46,7 @@ tar -C "$repo_root/patches" --exclude=.gitkeep -cf - . |
     ssh -p "$ssh_port" "$target" "tar -C '$storage_root/applications/koreader/patches' -xf -"
 
 printf '%s\n' 'Copying fonts/...'
+ssh -p "$ssh_port" "$target" "rm -rf '$storage_root/system/fonts/Libron'"
 tar -C "$repo_root/fonts" --exclude=.gitkeep -cf - . |
     ssh -p "$ssh_port" "$target" "tar -C '$storage_root/system/fonts' -xf -"
 
