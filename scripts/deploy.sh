@@ -29,6 +29,13 @@ case "$ssh_port" in
 esac
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fonts_manifest=$(mktemp "${TMPDIR:-/tmp}/koreader-fonts.XXXXXX")
+
+cleanup() {
+    rm -f "$fonts_manifest"
+}
+
+trap cleanup 0 HUP INT TERM
 
 for directory in patches fonts; do
     [ -d "$repo_root/$directory" ] || {
@@ -46,8 +53,33 @@ tar -C "$repo_root/patches" --exclude=.gitkeep -cf - . |
     ssh -p "$ssh_port" "$target" "tar -C '$storage_root/applications/koreader/patches' -xf -"
 
 printf '%s\n' 'Copying fonts/...'
-ssh -p "$ssh_port" "$target" "rm -rf '$storage_root/system/fonts/Libron'"
+find "$repo_root/fonts" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | LC_ALL=C sort > "$fonts_manifest"
 tar -C "$repo_root/fonts" --exclude=.gitkeep -cf - . |
     ssh -p "$ssh_port" "$target" "tar -C '$storage_root/system/fonts' -xf -"
+
+printf '%s\n' 'Removing obsolete managed fonts/...'
+scp -P "$ssh_port" "$fonts_manifest" "$target:$storage_root/system/fonts/.koreader-customisations-managed.new"
+ssh -p "$ssh_port" "$target" "sh -s -- '$storage_root/system/fonts'" <<'REMOTE_SCRIPT'
+fonts_root=$1
+manifest=$fonts_root/.koreader-customisations-managed
+next_manifest=$manifest.new
+
+if [ -f "$manifest" ]; then
+    while IFS= read -r directory || [ -n "$directory" ]; do
+        case "$directory" in
+            ''|.|..|*/*)
+                printf '%s\n' "Invalid managed font directory: $directory" >&2
+                exit 1
+                ;;
+        esac
+
+        if ! grep -Fqx "$directory" "$next_manifest" 2>/dev/null; then
+            rm -rf "$fonts_root/$directory"
+        fi
+    done < "$manifest"
+fi
+
+mv "$next_manifest" "$manifest"
+REMOTE_SCRIPT
 
 printf '%s\n' 'Deployment complete. Restart KOReader on the target to load changes.'

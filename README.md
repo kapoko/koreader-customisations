@@ -43,6 +43,8 @@ an SSH port when the device uses another mount point or port:
 scripts/deploy.sh reader@192.168.1.52 /mnt/ext1 22
 ```
 
-The script writes only to the supplied target. It removes only the legacy
-`system/fonts/Libron/` directory when deploying Libron R, and does not use the
-existing reader as a default.
+The script writes only to the supplied target and does not use the existing
+reader as a default. It records the top-level font directories it deploys in
+`system/fonts/.koreader-customisations-managed`; later deployments remove only
+directories previously recorded there which are no longer in `fonts/`. Other
+fonts on the device are left untouched.
